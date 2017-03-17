@@ -13,7 +13,7 @@ const (
 	ETCD_TIMEOUT   = "etcd.timeout"
 )
 
-func Init() {
+func Init(configFile string) {
 	hostname, err := os.Hostname()
 	if err != nil {
 		log.Println("failed to get hostname")

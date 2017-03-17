@@ -1,6 +1,7 @@
 package main
 
 import (
+	"github.com/allen13/con-job/pkg/config"
 	"github.com/allen13/con-job/pkg/scheduler"
 	"github.com/docopt/docopt-go"
 	"log"
@@ -23,6 +24,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	config.Init(args["config"].(string))
 	if args["scheduler"].(bool) {
 		scheduler, err := scheduler.Build()
 		if err != nil {

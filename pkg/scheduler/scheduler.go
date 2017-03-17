@@ -5,6 +5,7 @@ import (
 	"github.com/allen13/con-job/pkg/distributed"
 	"github.com/allen13/con-job/pkg/distributed/etcdstore"
 	"log"
+	"sync"
 	"time"
 )
 
@@ -25,6 +26,7 @@ func Build() (scheduler ConJobScheduler, err error) {
 }
 
 func (s *ConJobScheduler) Start() {
+	var watchWaitGroup sync.WaitGroup
 	for {
 		err := s.kvStore.RunForLeader()
 		if err != nil {
@@ -36,7 +38,13 @@ func (s *ConJobScheduler) Start() {
 		}
 
 		//elected leader start watching for events
-		s.kvStore.Watch("/nodes", s.onNodeKeyChange)
+		watchWaitGroup.Add(1)
+		go s.kvStore.Watch("/nodes", s.onNodeKeyChange, watchWaitGroup)
+
+		watchWaitGroup.Add(1)
+		go s.kvStore.Watch("/specifications", s.onSpecificationKeyChange, watchWaitGroup)
+
+		watchWaitGroup.Wait()
 	}
 
 }
@@ -44,8 +52,17 @@ func (s *ConJobScheduler) Start() {
 func (s *ConJobScheduler) onNodeKeyChange(event distributed.KeyValueEvent) {
 	switch event.Type {
 	case distributed.DELETE:
-		//what to do when a node gets delete
+		//what to do when a node gets deleted
 	case distributed.PUT:
 		//what to do when a node gets added
+	}
+}
+
+func (s *ConJobScheduler) onSpecificationKeyChange(event distributed.KeyValueEvent) {
+	switch event.Type {
+	case distributed.DELETE:
+	//what to do when a specification gets deleted
+	case distributed.PUT:
+		//what to do when a specification gets added
 	}
 }
