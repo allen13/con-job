@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"sync"
 	"sync/atomic"
@@ -61,7 +62,7 @@ import (
 )
 
 const (
-	DefaultSnapCount = 10000
+	DefaultSnapCount = 100000
 
 	StoreClusterPrefix = "/0"
 	StoreKeysPrefix    = "/1"
@@ -220,7 +221,7 @@ type EtcdServer struct {
 	stats  *stats.ServerStats
 	lstats *stats.LeaderStats
 
-	SyncTicker <-chan time.Time
+	SyncTicker *time.Ticker
 	// compactor is used to auto-compact the KV.
 	compactor *compactor.Periodic
 
@@ -263,7 +264,7 @@ func NewServer(cfg *ServerConfig) (srv *EtcdServer, err error) {
 	}
 	ss := snap.New(cfg.SnapDir())
 
-	bepath := path.Join(cfg.SnapDir(), databaseFilename)
+	bepath := filepath.Join(cfg.SnapDir(), databaseFilename)
 	beExist := fileutil.Exist(bepath)
 
 	var be backend.Backend
@@ -416,7 +417,7 @@ func NewServer(cfg *ServerConfig) (srv *EtcdServer, err error) {
 		r: raftNode{
 			isIDRemoved: func(id uint64) bool { return cl.IsIDRemoved(types.ID(id)) },
 			Node:        n,
-			ticker:      time.Tick(heartbeat),
+			ticker:      time.NewTicker(heartbeat),
 			// set up contention detectors for raft heartbeat message.
 			// expect to send a heartbeat within 2 heartbeat intervals.
 			td:          contention.NewTimeoutDetector(2 * heartbeat),
@@ -431,7 +432,7 @@ func NewServer(cfg *ServerConfig) (srv *EtcdServer, err error) {
 		cluster:       cl,
 		stats:         sstats,
 		lstats:        lstats,
-		SyncTicker:    time.Tick(500 * time.Millisecond),
+		SyncTicker:    time.NewTicker(500 * time.Millisecond),
 		peerRt:        prt,
 		reqIDGen:      idutil.NewGenerator(uint16(id), time.Now()),
 		forceVersionC: make(chan struct{}),
@@ -458,8 +459,16 @@ func NewServer(cfg *ServerConfig) (srv *EtcdServer, err error) {
 		}
 	}
 	srv.consistIndex.setConsistentIndex(srv.kv.ConsistentIndex())
-
-	srv.authStore = auth.NewAuthStore(srv.be)
+	tp, err := auth.NewTokenProvider(cfg.AuthToken,
+		func(index uint64) <-chan struct{} {
+			return srv.applyWait.Wait(index)
+		},
+	)
+	if err != nil {
+		plog.Errorf("failed to create token provider: %s", err)
+		return nil, err
+	}
+	srv.authStore = auth.NewAuthStore(srv.be, tp)
 	if h := cfg.AutoCompactionRetention; h != 0 {
 		srv.compactor = compactor.NewPeriodic(h, srv.kv, srv)
 		srv.compactor.Run()
@@ -591,6 +600,7 @@ func (s *EtcdServer) ReportSnapshot(id uint64, status raft.SnapshotStatus) {
 type etcdProgress struct {
 	confState raftpb.ConfState
 	snapi     uint64
+	appliedt  uint64
 	appliedi  uint64
 }
 
@@ -600,13 +610,17 @@ type etcdProgress struct {
 type raftReadyHandler struct {
 	updateLeadership     func()
 	updateCommittedIndex func(uint64)
+	waitForApply         func()
 }
 
 func (s *EtcdServer) run() {
-	snap, err := s.r.raftStorage.Snapshot()
+	sn, err := s.r.raftStorage.Snapshot()
 	if err != nil {
 		plog.Panicf("get snapshot from raft storage error: %v", err)
 	}
+
+	// asynchronously accept apply packets, dispatch progress in-order
+	sched := schedule.NewFIFOScheduler()
 
 	var (
 		smu   sync.RWMutex
@@ -634,7 +648,7 @@ func (s *EtcdServer) run() {
 				}
 				setSyncC(nil)
 			} else {
-				setSyncC(s.SyncTicker)
+				setSyncC(s.SyncTicker.C)
 				if s.compactor != nil {
 					s.compactor.Resume()
 				}
@@ -655,15 +669,17 @@ func (s *EtcdServer) run() {
 				s.setCommittedIndex(ci)
 			}
 		},
+		waitForApply: func() {
+			sched.WaitFinish(0)
+		},
 	}
 	s.r.start(rh)
 
-	// asynchronously accept apply packets, dispatch progress in-order
-	sched := schedule.NewFIFOScheduler()
 	ep := etcdProgress{
-		confState: snap.Metadata.ConfState,
-		snapi:     snap.Metadata.Index,
-		appliedi:  snap.Metadata.Index,
+		confState: sn.Metadata.ConfState,
+		snapi:     sn.Metadata.Index,
+		appliedt:  sn.Metadata.Term,
+		appliedi:  sn.Metadata.Index,
 	}
 
 	defer func() {
@@ -675,6 +691,8 @@ func (s *EtcdServer) run() {
 
 		// wait for gouroutines before closing raft so wal stays open
 		s.wg.Wait()
+
+		s.SyncTicker.Stop()
 
 		// must stop raft after scheduler-- etcdserver can leak rafthttp pipelines
 		// by adding a peer after raft stops the transport
@@ -762,7 +780,7 @@ func (s *EtcdServer) applyAll(ep *etcdProgress, apply *apply) {
 	select {
 	// snapshot requested via send()
 	case m := <-s.r.msgSnapC:
-		merged := s.createMergedSnapshotMessage(m, ep.appliedi, ep.confState)
+		merged := s.createMergedSnapshotMessage(m, ep.appliedt, ep.appliedi, ep.confState)
 		s.sendMergedSnap(merged)
 	default:
 	}
@@ -786,7 +804,7 @@ func (s *EtcdServer) applySnapshot(ep *etcdProgress, apply *apply) {
 		plog.Panicf("get database snapshot file path error: %v", err)
 	}
 
-	fn := path.Join(s.Cfg.SnapDir(), databaseFilename)
+	fn := filepath.Join(s.Cfg.SnapDir(), databaseFilename)
 	if err := os.Rename(snapfn, fn); err != nil {
 		plog.Panicf("rename snapshot file error: %v", err)
 	}
@@ -797,7 +815,7 @@ func (s *EtcdServer) applySnapshot(ep *etcdProgress, apply *apply) {
 	// If we recover mvcc.KV first, it will attach the keys to the wrong lessor before it recovers.
 	if s.lessor != nil {
 		plog.Info("recovering lessor...")
-		s.lessor.Recover(newbe, s.kv)
+		s.lessor.Recover(newbe, func() lease.TxnDelete { return s.kv.Write() })
 		plog.Info("finished recovering lessor")
 	}
 
@@ -864,6 +882,7 @@ func (s *EtcdServer) applySnapshot(ep *etcdProgress, apply *apply) {
 	}
 	plog.Info("finished adding peers from new cluster configuration into network...")
 
+	ep.appliedt = apply.snapshot.Metadata.Term
 	ep.appliedi = apply.snapshot.Metadata.Index
 	ep.snapi = ep.appliedi
 	ep.confState = apply.snapshot.Metadata.ConfState
@@ -885,7 +904,7 @@ func (s *EtcdServer) applyEntries(ep *etcdProgress, apply *apply) {
 		return
 	}
 	var shouldstop bool
-	if ep.appliedi, shouldstop = s.apply(ents, &ep.confState); shouldstop {
+	if ep.appliedt, ep.appliedi, shouldstop = s.apply(ents, &ep.confState); shouldstop {
 		go s.stopWithDelay(10*100*time.Millisecond, fmt.Errorf("the member has been permanently removed from the cluster"))
 	}
 }
@@ -1019,7 +1038,7 @@ func (s *EtcdServer) checkMembershipOperationPermission(ctx context.Context) err
 	// in the state machine layer
 	// However, both of membership change and role management requires the root privilege.
 	// So careful operation by admins can prevent the problem.
-	authInfo, err := s.authInfoFromCtx(ctx)
+	authInfo, err := s.AuthInfoFromCtx(ctx)
 	if err != nil {
 		return err
 	}
@@ -1239,9 +1258,7 @@ func (s *EtcdServer) sendMergedSnap(merged snap.Message) {
 // apply takes entries received from Raft (after it has been committed) and
 // applies them to the current state of the EtcdServer.
 // The given entries should not be empty.
-func (s *EtcdServer) apply(es []raftpb.Entry, confState *raftpb.ConfState) (uint64, bool) {
-	var applied uint64
-	var shouldstop bool
+func (s *EtcdServer) apply(es []raftpb.Entry, confState *raftpb.ConfState) (appliedt uint64, appliedi uint64, shouldStop bool) {
 	for i := range es {
 		e := es[i]
 		switch e.Type {
@@ -1251,16 +1268,17 @@ func (s *EtcdServer) apply(es []raftpb.Entry, confState *raftpb.ConfState) (uint
 			var cc raftpb.ConfChange
 			pbutil.MustUnmarshal(&cc, e.Data)
 			removedSelf, err := s.applyConfChange(cc, confState)
-			shouldstop = shouldstop || removedSelf
+			shouldStop = shouldStop || removedSelf
 			s.w.Trigger(cc.ID, err)
 		default:
 			plog.Panicf("entry type should be either EntryNormal or EntryConfChange")
 		}
 		atomic.StoreUint64(&s.r.index, e.Index)
 		atomic.StoreUint64(&s.r.term, e.Term)
-		applied = e.Index
+		appliedt = e.Term
+		appliedi = e.Index
 	}
-	return applied, shouldstop
+	return appliedt, appliedi, shouldStop
 }
 
 // applyEntryNormal apples an EntryNormal type raftpb request to the EtcdServer

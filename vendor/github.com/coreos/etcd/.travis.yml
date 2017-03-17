@@ -4,8 +4,12 @@ go_import_path: github.com/coreos/etcd
 sudo: false
 
 go:
-  - 1.7.4
+  - 1.8
   - tip
+
+notifications:
+  on_success: never
+  on_failure: never
 
 env:
   matrix:
@@ -38,8 +42,9 @@ addons:
 
 before_install:
  - go get -v github.com/chzchzchz/goword
- - go get -v honnef.co/go/simple/cmd/gosimple
- - go get -v honnef.co/go/unused/cmd/unused
+ - go get -v honnef.co/go/tools/cmd/gosimple
+ - go get -v honnef.co/go/tools/cmd/unused
+ - go get -v honnef.co/go/tools/cmd/staticcheck
 
 # disable godep restore override
 install:

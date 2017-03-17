@@ -34,6 +34,7 @@ func TestCtlV3AuthMemberRemove(t *testing.T) {
 	testCtl(t, authTestMemberRemove, withQuorum(), withNoStrictReconfig())
 }
 func TestCtlV3AuthMemberUpdate(t *testing.T) { testCtl(t, authTestMemberUpdate) }
+func TestCtlV3AuthCertCN(t *testing.T)       { testCtl(t, authTestCertCN, withCfg(configClientTLSCertAuth)) }
 
 func authEnableTest(cx ctlCtx) {
 	if err := authEnable(cx); err != nil {
@@ -486,32 +487,17 @@ func authTestMemberRemove(cx ctlCtx) {
 	cx.user, cx.pass = "root", "root"
 	authSetupTestUser(cx)
 
-	n1 := cx.cfg.clusterSize
-	if n1 < 2 {
-		cx.t.Fatalf("%d-node is too small to test 'member remove'", n1)
-	}
-	resp, err := getMemberList(cx)
-	if err != nil {
-		cx.t.Fatal(err)
-	}
-	if n1 != len(resp.Members) {
-		cx.t.Fatalf("expected %d, got %d", n1, len(resp.Members))
-	}
-
-	var (
-		memIDToRemove = fmt.Sprintf("%x", resp.Header.MemberId)
-		clusterID     = fmt.Sprintf("%x", resp.Header.ClusterId)
-	)
+	memIDToRemove, clusterID := cx.memberToRemove()
 
 	// ordinal user cannot remove a member
 	cx.user, cx.pass = "test-user", "pass"
-	if err = ctlV3MemberRemove(cx, memIDToRemove, clusterID); err == nil {
+	if err := ctlV3MemberRemove(cx, memIDToRemove, clusterID); err == nil {
 		cx.t.Fatalf("ordinal user must not be allowed to remove a member")
 	}
 
 	// root can remove a member
 	cx.user, cx.pass = "root", "root"
-	if err = ctlV3MemberRemove(cx, memIDToRemove, clusterID); err != nil {
+	if err := ctlV3MemberRemove(cx, memIDToRemove, clusterID); err != nil {
 		cx.t.Fatal(err)
 	}
 }
@@ -540,6 +526,39 @@ func authTestMemberUpdate(cx ctlCtx) {
 	// root can update a member
 	cx.user, cx.pass = "root", "root"
 	if err = ctlV3MemberUpdate(cx, memberID, peerURL); err != nil {
+		cx.t.Fatal(err)
+	}
+}
+
+func authTestCertCN(cx ctlCtx) {
+	if err := ctlV3User(cx, []string{"add", "etcd", "--interactive=false"}, "User etcd created", []string{""}); err != nil {
+		cx.t.Fatal(err)
+	}
+	if err := spawnWithExpect(append(cx.PrefixArgs(), "role", "add", "test-role"), "Role test-role created"); err != nil {
+		cx.t.Fatal(err)
+	}
+	if err := ctlV3User(cx, []string{"grant-role", "etcd", "test-role"}, "Role test-role is granted to user etcd", nil); err != nil {
+		cx.t.Fatal(err)
+	}
+	cmd := append(cx.PrefixArgs(), "role", "grant-permission", "test-role", "readwrite", "foo")
+	if err := spawnWithExpect(cmd, "Role test-role updated"); err != nil {
+		cx.t.Fatal(err)
+	}
+
+	// grant a new key
+	if err := ctlV3RoleGrantPermission(cx, "test-role", grantingPerm{true, true, "hoo", "", false}); err != nil {
+		cx.t.Fatal(err)
+	}
+
+	// try a granted key
+	cx.user, cx.pass = "", ""
+	if err := ctlV3Put(cx, "hoo", "bar", ""); err != nil {
+		cx.t.Fatal(err)
+	}
+
+	// try a non granted key
+	cx.user, cx.pass = "", ""
+	if err := ctlV3PutFailPerm(cx, "baz", "bar"); err == nil {
 		cx.t.Fatal(err)
 	}
 }

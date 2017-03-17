@@ -17,8 +17,6 @@ package etcdserver
 import (
 	"bytes"
 	"encoding/binary"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/coreos/etcd/auth"
@@ -31,7 +29,6 @@ import (
 
 	"github.com/coreos/go-semver/semver"
 	"golang.org/x/net/context"
-	"google.golang.org/grpc/metadata"
 )
 
 const (
@@ -110,7 +107,7 @@ func (s *EtcdServer) Range(ctx context.Context, r *pb.RangeRequest) (*pb.RangeRe
 	chk := func(ai *auth.AuthInfo) error {
 		return s.authStore.IsRangePermitted(ai, r.Key, r.RangeEnd)
 	}
-	get := func() { resp, err = s.applyV3Base.Range(noTxn, r) }
+	get := func() { resp, err = s.applyV3Base.Range(nil, r) }
 	if serr := s.doSerialize(ctx, chk, get); serr != nil {
 		return nil, serr
 	}
@@ -125,7 +122,7 @@ func (s *EtcdServer) legacyRange(ctx context.Context, r *pb.RangeRequest) (*pb.R
 		chk := func(ai *auth.AuthInfo) error {
 			return s.authStore.IsRangePermitted(ai, r.Key, r.RangeEnd)
 		}
-		get := func() { resp, err = s.applyV3Base.Range(noTxn, r) }
+		get := func() { resp, err = s.applyV3Base.Range(nil, r) }
 		if serr := s.doSerialize(ctx, chk, get); serr != nil {
 			return nil, serr
 		}
@@ -444,7 +441,7 @@ func (s *EtcdServer) Authenticate(ctx context.Context, r *pb.AuthenticateRequest
 			return nil, err
 		}
 
-		st, err := s.AuthStore().GenSimpleToken()
+		st, err := s.AuthStore().GenTokenPrefix()
 		if err != nil {
 			return nil, err
 		}
@@ -617,52 +614,10 @@ func (s *EtcdServer) RoleDelete(ctx context.Context, r *pb.AuthRoleDeleteRequest
 	return result.resp.(*pb.AuthRoleDeleteResponse), nil
 }
 
-func (s *EtcdServer) isValidSimpleToken(token string) bool {
-	splitted := strings.Split(token, ".")
-	if len(splitted) != 2 {
-		return false
-	}
-	index, err := strconv.Atoi(splitted[1])
-	if err != nil {
-		return false
-	}
-
-	select {
-	case <-s.applyWait.Wait(uint64(index)):
-		return true
-	case <-s.stop:
-		return true
-	}
-}
-
-func (s *EtcdServer) authInfoFromCtx(ctx context.Context) (*auth.AuthInfo, error) {
-	md, ok := metadata.FromContext(ctx)
-	if !ok {
-		return nil, nil
-	}
-
-	ts, tok := md["token"]
-	if !tok {
-		return nil, nil
-	}
-
-	token := ts[0]
-	if !s.isValidSimpleToken(token) {
-		return nil, ErrInvalidAuthToken
-	}
-
-	authInfo, uok := s.AuthStore().AuthInfoFromToken(token)
-	if !uok {
-		plog.Warningf("invalid auth token: %s", token)
-		return nil, ErrInvalidAuthToken
-	}
-	return authInfo, nil
-}
-
 // doSerialize handles the auth logic, with permissions checked by "chk", for a serialized request "get". Returns a non-nil error on authentication failure.
 func (s *EtcdServer) doSerialize(ctx context.Context, chk func(*auth.AuthInfo) error, get func()) error {
 	for {
-		ai, err := s.authInfoFromCtx(ctx)
+		ai, err := s.AuthInfoFromCtx(ctx)
 		if err != nil {
 			return err
 		}
@@ -697,7 +652,7 @@ func (s *EtcdServer) processInternalRaftRequestOnce(ctx context.Context, r pb.In
 		ID: s.reqIDGen.Next(),
 	}
 
-	authInfo, err := s.authInfoFromCtx(ctx)
+	authInfo, err := s.AuthInfoFromCtx(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -846,4 +801,15 @@ func (s *EtcdServer) linearizableReadNotify(ctx context.Context) error {
 	case <-s.done:
 		return ErrStopped
 	}
+}
+
+func (s *EtcdServer) AuthInfoFromCtx(ctx context.Context) (*auth.AuthInfo, error) {
+	if s.Cfg.ClientCertAuthEnabled {
+		authInfo := s.AuthStore().AuthInfoFromTLS(ctx)
+		if authInfo != nil {
+			return authInfo, nil
+		}
+	}
+
+	return s.AuthStore().AuthInfoFromCtx(ctx)
 }

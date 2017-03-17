@@ -332,8 +332,7 @@
             "in": "body",
             "required": true,
             "schema": {
-              "type": "string",
-              "format": "string"
+              "$ref": "#/definitions/subStringMessage"
             }
           }
         ],
@@ -486,10 +485,6 @@
         "string_value": {
           "type": "string",
           "format": "string"
-        },
-        "timestamp_value": {
-          "type": "string",
-          "format": "date-time"
         },
         "uint32_value": {
           "type": "integer",

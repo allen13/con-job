@@ -19,7 +19,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"path"
+	"path/filepath"
 
 	"github.com/coreos/etcd/etcdserver"
 	"github.com/coreos/etcd/etcdserver/api/v2http"
@@ -118,6 +118,7 @@ func StartEtcd(inCfg *Config) (e *Etcd, err error) {
 		QuotaBackendBytes:       cfg.QuotaBackendBytes,
 		StrictReconfigCheck:     cfg.StrictReconfigCheck,
 		ClientCertAuthEnabled:   cfg.ClientTLSInfo.ClientCertAuth,
+		AuthToken:               cfg.AuthToken,
 	}
 
 	if e.Server, err = etcdserver.NewServer(srvcfg); err != nil {
@@ -166,7 +167,7 @@ func startPeerListeners(cfg *Config) (plns []net.Listener, err error) {
 		for i, u := range cfg.LPUrls {
 			phosts[i] = u.Host
 		}
-		cfg.PeerTLSInfo, err = transport.SelfCert(path.Join(cfg.Dir, "fixtures/peer"), phosts)
+		cfg.PeerTLSInfo, err = transport.SelfCert(filepath.Join(cfg.Dir, "fixtures", "peer"), phosts)
 		if err != nil {
 			plog.Fatalf("could not get certs (%v)", err)
 		}
@@ -221,7 +222,7 @@ func startClientListeners(cfg *Config) (sctxs map[string]*serveCtx, err error) {
 		for i, u := range cfg.LCUrls {
 			chosts[i] = u.Host
 		}
-		cfg.ClientTLSInfo, err = transport.SelfCert(path.Join(cfg.Dir, "fixtures/client"), chosts)
+		cfg.ClientTLSInfo, err = transport.SelfCert(filepath.Join(cfg.Dir, "fixtures", "client"), chosts)
 		if err != nil {
 			plog.Fatalf("could not get certs (%v)", err)
 		}
@@ -289,8 +290,12 @@ func startClientListeners(cfg *Config) (sctxs map[string]*serveCtx, err error) {
 		for k := range cfg.UserHandlers {
 			sctx.userHandlers[k] = cfg.UserHandlers[k]
 		}
-		if cfg.EnablePprof {
+		sctx.serviceRegister = cfg.ServiceRegister
+		if cfg.EnablePprof || cfg.Debug {
 			sctx.registerPprof()
+		}
+		if cfg.Debug {
+			sctx.registerTrace()
 		}
 		sctxs[u.Host] = sctx
 	}
@@ -319,15 +324,18 @@ func (e *Etcd) serve() (err error) {
 	}
 
 	// Start a client server goroutine for each listen address
-	ch := http.Handler(&cors.CORSHandler{
-		Handler: v2http.NewClientHandler(e.Server, e.Server.Cfg.ReqTimeout()),
-		Info:    e.cfg.CorsInfo,
-	})
+	var v2h http.Handler
+	if e.Config().EnableV2 {
+		v2h = http.Handler(&cors.CORSHandler{
+			Handler: v2http.NewClientHandler(e.Server, e.Server.Cfg.ReqTimeout()),
+			Info:    e.cfg.CorsInfo,
+		})
+	}
 	for _, sctx := range e.sctxs {
 		// read timeout does not work with http close notify
 		// TODO: https://github.com/golang/go/issues/9524
 		go func(s *serveCtx) {
-			e.errc <- s.serve(e.Server, ctlscfg, ch, e.errc)
+			e.errc <- s.serve(e.Server, ctlscfg, v2h, e.errc)
 		}(sctx)
 	}
 	return nil

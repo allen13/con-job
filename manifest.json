@@ -1,0 +1,16 @@
+{
+    "dependencies": {
+        "github.com/coreos/etcd": {
+            "branch": "master"
+        },
+        "github.com/docopt/docopt-go": {
+            "branch": "master"
+        },
+        "github.com/labstack/echo": {
+            "branch": "master"
+        },
+        "golang.org/x/net": {
+            "branch": "master"
+        }
+    }
+}

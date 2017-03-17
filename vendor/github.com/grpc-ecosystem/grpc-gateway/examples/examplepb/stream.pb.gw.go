@@ -112,11 +112,8 @@ func request_StreamService_BulkEcho_0(ctx context.Context, marshaler runtime.Mar
 		return nil
 	}
 	if err := handleSend(); err != nil {
-		if cerr := stream.CloseSend(); cerr != nil {
-			grpclog.Printf("Failed to terminate client stream: %v", cerr)
-		}
-		if err == io.EOF {
-			return stream, metadata, nil
+		if err := stream.CloseSend(); err != nil {
+			grpclog.Printf("Failed to terminate client stream: %v", err)
 		}
 		return nil, metadata, err
 	}

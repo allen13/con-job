@@ -18,7 +18,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -29,6 +28,9 @@ import (
 	"github.com/coreos/pkg/capnslog"
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/net/context"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 )
 
 var (
@@ -57,6 +59,8 @@ var (
 	ErrPermissionNotGranted = errors.New("auth: permission is not granted to the role")
 	ErrAuthNotEnabled       = errors.New("auth: authentication is not enabled")
 	ErrAuthOldRevision      = errors.New("auth: revision in header is old")
+	ErrInvalidAuthToken     = errors.New("auth: invalid auth token")
+	ErrInvalidAuthOpts      = errors.New("auth: invalid auth options")
 
 	// BcryptCost is the algorithm cost / strength for hashing auth passwords
 	BcryptCost = bcrypt.DefaultCost
@@ -126,10 +130,6 @@ type AuthStore interface {
 	// RoleList gets a list of all roles
 	RoleList(r *pb.AuthRoleListRequest) (*pb.AuthRoleListResponse, error)
 
-	// AuthInfoFromToken gets a username from the given Token and current revision number
-	// (The revision number is used for preventing the TOCTOU problem)
-	AuthInfoFromToken(token string) (*AuthInfo, bool)
-
 	// IsPutPermitted checks put permission of the user
 	IsPutPermitted(authInfo *AuthInfo, key []byte) error
 
@@ -142,8 +142,9 @@ type AuthStore interface {
 	// IsAdminPermitted checks admin permission of the user
 	IsAdminPermitted(authInfo *AuthInfo) error
 
-	// GenSimpleToken produces a simple random string
-	GenSimpleToken() (string, error)
+	// GenTokenPrefix produces a random string in a case of simple token
+	// in a case of JWT, it produces an empty string
+	GenTokenPrefix() (string, error)
 
 	// Revision gets current revision of authStore
 	Revision() uint64
@@ -153,6 +154,22 @@ type AuthStore interface {
 
 	// Close does cleanup of AuthStore
 	Close() error
+
+	// AuthInfoFromCtx gets AuthInfo from gRPC's context
+	AuthInfoFromCtx(ctx context.Context) (*AuthInfo, error)
+
+	// AuthInfoFromTLS gets AuthInfo from TLS info of gRPC's context
+	AuthInfoFromTLS(ctx context.Context) *AuthInfo
+}
+
+type TokenProvider interface {
+	info(ctx context.Context, token string, revision uint64) (*AuthInfo, bool)
+	assign(ctx context.Context, username string, revision uint64) (string, error)
+	enable()
+	disable()
+
+	invalidateUser(string)
+	genTokenPrefix() (string, error)
 }
 
 type authStore struct {
@@ -162,11 +179,9 @@ type authStore struct {
 
 	rangePermCache map[string]*unifiedRangePermissions // username -> unifiedRangePermissions
 
-	simpleTokensMu    sync.RWMutex
-	simpleTokens      map[string]string // token -> username
-	simpleTokenKeeper *simpleTokenTTLKeeper
-
 	revision uint64
+
+	tokenProvider TokenProvider
 }
 
 func (as *authStore) AuthEnable() error {
@@ -196,16 +211,7 @@ func (as *authStore) AuthEnable() error {
 	tx.UnsafePut(authBucketName, enableFlagKey, authEnabled)
 
 	as.enabled = true
-
-	tokenDeleteFunc := func(t string) {
-		as.simpleTokensMu.Lock()
-		defer as.simpleTokensMu.Unlock()
-		if username, ok := as.simpleTokens[t]; ok {
-			plog.Infof("deleting token %s for user %s", t, username)
-			delete(as.simpleTokens, t)
-		}
-	}
-	as.simpleTokenKeeper = NewSimpleTokenTTLKeeper(tokenDeleteFunc)
+	as.tokenProvider.enable()
 
 	as.rangePermCache = make(map[string]*unifiedRangePermissions)
 
@@ -231,14 +237,7 @@ func (as *authStore) AuthDisable() {
 	b.ForceCommit()
 
 	as.enabled = false
-
-	as.simpleTokensMu.Lock()
-	as.simpleTokens = make(map[string]string) // invalidate all tokens
-	as.simpleTokensMu.Unlock()
-	if as.simpleTokenKeeper != nil {
-		as.simpleTokenKeeper.stop()
-		as.simpleTokenKeeper = nil
-	}
+	as.tokenProvider.disable()
 
 	plog.Noticef("Authentication disabled")
 }
@@ -249,10 +248,7 @@ func (as *authStore) Close() error {
 	if !as.enabled {
 		return nil
 	}
-	if as.simpleTokenKeeper != nil {
-		as.simpleTokenKeeper.stop()
-		as.simpleTokenKeeper = nil
-	}
+	as.tokenProvider.disable()
 	return nil
 }
 
@@ -260,10 +256,6 @@ func (as *authStore) Authenticate(ctx context.Context, username, password string
 	if !as.isAuthEnabled() {
 		return nil, ErrAuthNotEnabled
 	}
-
-	// TODO(mitake): after adding jwt support, branching based on values of ctx is required
-	index := ctx.Value("index").(uint64)
-	simpleToken := ctx.Value("simpleToken").(string)
 
 	tx := as.be.BatchTx()
 	tx.Lock()
@@ -274,10 +266,15 @@ func (as *authStore) Authenticate(ctx context.Context, username, password string
 		return nil, ErrAuthFailed
 	}
 
-	token := fmt.Sprintf("%s.%d", simpleToken, index)
-	as.assignSimpleTokenToUser(username, token)
+	// Password checking is already performed in the API layer, so we don't need to check for now.
+	// Staleness of password can be detected with OCC in the API layer, too.
 
-	plog.Infof("authorized %s, token is %s", username, token)
+	token, err := as.tokenProvider.assign(ctx, username, as.revision)
+	if err != nil {
+		return nil, err
+	}
+
+	plog.Debugf("authorized %s, token is %s", username, token)
 	return &pb.AuthenticateResponse{Token: token}, nil
 }
 
@@ -369,7 +366,7 @@ func (as *authStore) UserDelete(r *pb.AuthUserDeleteRequest) (*pb.AuthUserDelete
 	as.commitRevision(tx)
 
 	as.invalidateCachedPerm(r.Name)
-	as.invalidateUser(r.Name)
+	as.tokenProvider.invalidateUser(r.Name)
 
 	plog.Noticef("deleted a user: %s", r.Name)
 
@@ -405,7 +402,7 @@ func (as *authStore) UserChangePassword(r *pb.AuthUserChangePasswordRequest) (*p
 	as.commitRevision(tx)
 
 	as.invalidateCachedPerm(r.Name)
-	as.invalidateUser(r.Name)
+	as.tokenProvider.invalidateUser(r.Name)
 
 	plog.Noticef("changed a password of a user: %s", r.Name)
 
@@ -634,14 +631,8 @@ func (as *authStore) RoleAdd(r *pb.AuthRoleAddRequest) (*pb.AuthRoleAddResponse,
 	return &pb.AuthRoleAddResponse{}, nil
 }
 
-func (as *authStore) AuthInfoFromToken(token string) (*AuthInfo, bool) {
-	as.simpleTokensMu.RLock()
-	defer as.simpleTokensMu.RUnlock()
-	t, ok := as.simpleTokens[token]
-	if ok {
-		as.simpleTokenKeeper.resetSimpleToken(token)
-	}
-	return &AuthInfo{Username: t, Revision: as.revision}, ok
+func (as *authStore) authInfoFromToken(ctx context.Context, token string) (*AuthInfo, bool) {
+	return as.tokenProvider.info(ctx, token, as.revision)
 }
 
 type permSlice []*authpb.Permission
@@ -752,6 +743,9 @@ func (as *authStore) IsDeleteRangePermitted(authInfo *AuthInfo, key, rangeEnd []
 func (as *authStore) IsAdminPermitted(authInfo *AuthInfo) error {
 	if !as.isAuthEnabled() {
 		return nil
+	}
+	if authInfo == nil {
+		return ErrUserEmpty
 	}
 
 	tx := as.be.BatchTx()
@@ -871,7 +865,7 @@ func (as *authStore) isAuthEnabled() bool {
 	return as.enabled
 }
 
-func NewAuthStore(be backend.Backend) *authStore {
+func NewAuthStore(be backend.Backend, tp TokenProvider) *authStore {
 	tx := be.BatchTx()
 	tx.Lock()
 
@@ -879,13 +873,29 @@ func NewAuthStore(be backend.Backend) *authStore {
 	tx.UnsafeCreateBucket(authUsersBucketName)
 	tx.UnsafeCreateBucket(authRolesBucketName)
 
-	as := &authStore{
-		be:           be,
-		simpleTokens: make(map[string]string),
-		revision:     0,
+	enabled := false
+	_, vs := tx.UnsafeRange(authBucketName, enableFlagKey, nil, 0)
+	if len(vs) == 1 {
+		if bytes.Equal(vs[0], authEnabled) {
+			enabled = true
+		}
 	}
 
-	as.commitRevision(tx)
+	as := &authStore{
+		be:             be,
+		revision:       getRevision(tx),
+		enabled:        enabled,
+		rangePermCache: make(map[string]*unifiedRangePermissions),
+		tokenProvider:  tp,
+	}
+
+	if enabled {
+		as.tokenProvider.enable()
+	}
+
+	if as.revision == 0 {
+		as.commitRevision(tx)
+	}
 
 	tx.Unlock()
 	be.ForceCommit()
@@ -912,7 +922,8 @@ func (as *authStore) commitRevision(tx backend.BatchTx) {
 func getRevision(tx backend.BatchTx) uint64 {
 	_, vs := tx.UnsafeRange(authBucketName, []byte(revisionKey), nil, 0)
 	if len(vs) != 1 {
-		plog.Panicf("failed to get the key of auth store revision")
+		// this can happen in the initialization phase
+		return 0
 	}
 
 	return binary.BigEndian.Uint64(vs[0])
@@ -920,4 +931,93 @@ func getRevision(tx backend.BatchTx) uint64 {
 
 func (as *authStore) Revision() uint64 {
 	return as.revision
+}
+
+func (as *authStore) AuthInfoFromTLS(ctx context.Context) *AuthInfo {
+	peer, ok := peer.FromContext(ctx)
+	if !ok || peer == nil || peer.AuthInfo == nil {
+		return nil
+	}
+
+	tlsInfo := peer.AuthInfo.(credentials.TLSInfo)
+	for _, chains := range tlsInfo.State.VerifiedChains {
+		for _, chain := range chains {
+			cn := chain.Subject.CommonName
+			plog.Debugf("found common name %s", cn)
+
+			return &AuthInfo{
+				Username: cn,
+				Revision: as.Revision(),
+			}
+		}
+	}
+
+	return nil
+}
+
+func (as *authStore) AuthInfoFromCtx(ctx context.Context) (*AuthInfo, error) {
+	md, ok := metadata.FromContext(ctx)
+	if !ok {
+		return nil, nil
+	}
+
+	ts, tok := md["token"]
+	if !tok {
+		return nil, nil
+	}
+
+	token := ts[0]
+	authInfo, uok := as.authInfoFromToken(ctx, token)
+	if !uok {
+		plog.Warningf("invalid auth token: %s", token)
+		return nil, ErrInvalidAuthToken
+	}
+	return authInfo, nil
+}
+
+func (as *authStore) GenTokenPrefix() (string, error) {
+	return as.tokenProvider.genTokenPrefix()
+}
+
+func decomposeOpts(optstr string) (string, map[string]string, error) {
+	opts := strings.Split(optstr, ",")
+	tokenType := opts[0]
+
+	typeSpecificOpts := make(map[string]string)
+	for i := 1; i < len(opts); i++ {
+		pair := strings.Split(opts[i], "=")
+
+		if len(pair) != 2 {
+			plog.Errorf("invalid token specific option: %s", optstr)
+			return "", nil, ErrInvalidAuthOpts
+		}
+
+		if _, ok := typeSpecificOpts[pair[0]]; ok {
+			plog.Errorf("invalid token specific option, duplicated parameters (%s): %s", pair[0], optstr)
+			return "", nil, ErrInvalidAuthOpts
+		}
+
+		typeSpecificOpts[pair[0]] = pair[1]
+	}
+
+	return tokenType, typeSpecificOpts, nil
+
+}
+
+func NewTokenProvider(tokenOpts string, indexWaiter func(uint64) <-chan struct{}) (TokenProvider, error) {
+	tokenType, typeSpecificOpts, err := decomposeOpts(tokenOpts)
+	if err != nil {
+		return nil, ErrInvalidAuthOpts
+	}
+
+	switch tokenType {
+	case "simple":
+		plog.Warningf("simple token is not cryptographically signed")
+		return newTokenProviderSimple(indexWaiter), nil
+	case "jwt":
+		return newTokenProviderJWT(typeSpecificOpts)
+	default:
+		plog.Errorf("unknown token type: %s", tokenType)
+		return nil, ErrInvalidAuthOpts
+	}
 }
