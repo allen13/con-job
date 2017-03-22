@@ -54,7 +54,7 @@ func (e *EtcdStore) RunForLeader() (err error) {
 	return
 }
 
-func (e *EtcdStore) Watch(keypath string, keyValueEventCallback distributed.KeyValueEventCallback, watchWaitGroup sync.WaitGroup) {
+func (e *EtcdStore) Watch(keypath string, keyValueEventCallback distributed.KeyValueEventCallback, watchWaitGroup *sync.WaitGroup) {
 	watchChannel := e.etcdClient.Watch(context.Background(), keypath)
 	for watchResponse := range watchChannel {
 		for _, event := range watchResponse.Events {
@@ -90,6 +90,11 @@ func (e *EtcdStore) SoftPut(key string, value string) (err error) {
 	return
 }
 
+func (e *EtcdStore) Delete(key string) (err error) {
+	_, err = e.etcdClient.Delete(context.Background(), key)
+	return
+}
+
 func (e *EtcdStore) getLeaseId() (clientv3.LeaseID, error) {
 	if e.leaseId == 0 {
 		return e.leaseId, nil
@@ -109,7 +114,7 @@ func (e *EtcdStore) getLeaseId() (clientv3.LeaseID, error) {
 
 func (e *EtcdStore) keepLeaseAlive() {
 	ticker := time.NewTicker(time.Second * 10)
-	for _ := range ticker.C {
+	for range ticker.C {
 		e.etcdClient.KeepAlive(context.Background(), e.leaseId)
 	}
 }

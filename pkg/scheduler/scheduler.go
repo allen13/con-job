@@ -1,20 +1,20 @@
 package scheduler
 
 import (
-	"github.com/allen13/con-job/pkg/config"
+	"fmt"
 	"github.com/allen13/con-job/pkg/distributed"
 	"github.com/allen13/con-job/pkg/distributed/etcdstore"
 	"log"
+	"strings"
 	"sync"
-	"time"
 )
 
-type ConJobScheduler struct {
+type Scheduler struct {
 	kvStore distributed.KeyValueStore
 }
 
-func Build() (scheduler ConJobScheduler, err error) {
-	scheduler = ConJobScheduler{}
+func Build() (scheduler Scheduler, err error) {
+	scheduler = Scheduler{}
 	etcdStore, err := etcdstore.Build()
 	if err != nil {
 		return
@@ -25,44 +25,46 @@ func Build() (scheduler ConJobScheduler, err error) {
 	return
 }
 
-func (s *ConJobScheduler) Start() {
+func (s *Scheduler) Start() {
 	var watchWaitGroup sync.WaitGroup
-	for {
-		err := s.kvStore.RunForLeader()
-		if err != nil {
-			log.Println(err)
-			retryTimeout := config.GetEtcdTimeout()
-			log.Printf("attempting re-election in %s\n", retryTimeout/time.Second)
-			time.Sleep(retryTimeout)
-			continue
-		}
-
-		//elected leader start watching for events
-		watchWaitGroup.Add(1)
-		go s.kvStore.Watch("/nodes", s.onNodeKeyChange, watchWaitGroup)
-
-		watchWaitGroup.Add(1)
-		go s.kvStore.Watch("/specifications", s.onSpecificationKeyChange, watchWaitGroup)
-
-		watchWaitGroup.Wait()
+	err := s.kvStore.RunForLeader()
+	if err != nil {
+		log.Println(err)
+		//retryTimeout := config.GetEtcdTimeout()
+		//log.Printf("attempting re-election in %s\n", retryTimeout/time.Second)
+		//time.Sleep(retryTimeout)
+		return
 	}
+
+	//elected leader start watching for events
+	watchWaitGroup.Add(1)
+	go s.kvStore.Watch("/nodes", s.onNodeKeyChange, &watchWaitGroup)
+
+	watchWaitGroup.Add(1)
+	go s.kvStore.Watch("/specifications", s.onSpecificationKeyChange, &watchWaitGroup)
+	watchWaitGroup.Wait()
 
 }
 
-func (s *ConJobScheduler) onNodeKeyChange(event distributed.KeyValueEvent) {
+func (s *Scheduler) onNodeKeyChange(event distributed.KeyValueEvent) {
+	separatedKeyPath := strings.Split(event.Key, "/")
+	baseKeyName := separatedKeyPath[len(separatedKeyPath)-1]
+	fmt.Println(baseKeyName)
 	switch event.Type {
 	case distributed.DELETE:
-		//what to do when a node gets deleted
+		s.kvStore.Delete(baseKeyName)
 	case distributed.PUT:
-		//what to do when a node gets added
+		s.kvStore.Put(baseKeyName, event.Value)
 	}
 }
 
-func (s *ConJobScheduler) onSpecificationKeyChange(event distributed.KeyValueEvent) {
+func (s *Scheduler) onSpecificationKeyChange(event distributed.KeyValueEvent) {
+	separatedKeyPath := strings.Split(event.Key, "/")
+	baseKeyName := separatedKeyPath[len(separatedKeyPath)-1]
 	switch event.Type {
 	case distributed.DELETE:
-	//what to do when a specification gets deleted
+		s.kvStore.Delete(baseKeyName)
 	case distributed.PUT:
-		//what to do when a specification gets added
+		s.kvStore.Put(baseKeyName, event.Value)
 	}
 }
